@@ -75,8 +75,20 @@ export const UEDeleteObject = (actor_names: string) =>
 		actor_names,
 	})
 
-export const UEBlueprintToText = (asset_path: string) =>
-	Template(read("./scripts/ue_blueprint_to_text.py"), { asset_path })
+export const UEBlueprintToText = (
+	asset_path: string,
+	max_graphs?: number,
+	max_nodes_per_graph?: number,
+	include_pins: boolean = true,
+) => {
+	const script = read("./scripts/ue_blueprint_to_text.py")
+	const escapedAssetPath = asset_path.replaceAll("\\", "\\\\").replaceAll('"', '\\"')
+	return script
+		.replace("${asset_path}", escapedAssetPath)
+		.replace("${max_graphs}", max_graphs !== undefined ? JSON.stringify(max_graphs) : "null")
+		.replace("${max_nodes_per_graph}", max_nodes_per_graph !== undefined ? JSON.stringify(max_nodes_per_graph) : "null")
+		.replace("${include_pins}", JSON.stringify(include_pins))
+}
 
 export const UETakeScreenshot = () => Template(read("./scripts/ue_take_screenshot.py"))
 

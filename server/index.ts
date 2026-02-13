@@ -192,12 +192,30 @@ server.tool(
 
 server.tool(
 	"editor_blueprint_to_text",
-	"Convert a Blueprint asset to a human-readable structured JSON representation.\n\nParses Unreal's text export of the Blueprint and returns metadata plus graph logic (EventGraph/Function/Macro graphs), nodes, pins, links, variable declarations, and common references (events/functions/variables).\n\nUse this tool to analyze Blueprint behavior for BP-to-C++ migration.\n\nExample output: {'name': 'BP_MyActor', 'parent_class': 'Actor', 'variables': [{'name': 'Health', 'type': 'float'}], 'graphs': [{'name': 'EventGraph', 'nodes': [{'class': 'K2Node_Event', 'event_name': 'ReceiveBeginPlay'}]}]}",
+	"Convert a Blueprint asset to a human-readable structured JSON representation.\n\nParses Unreal's text export of the Blueprint and returns metadata plus graph logic (EventGraph/Function/Macro graphs), nodes, pins, links, variable declarations, and common references (events/functions/variables).\n\nUse max_graphs / max_nodes_per_graph and include_pins to control output size for large Blueprints.\n\nUse this tool to analyze Blueprint behavior for BP-to-C++ migration.\n\nExample output: {'name': 'BP_MyActor', 'parent_class': 'Actor', 'variables': [{'name': 'Health', 'type': 'float'}], 'graphs': [{'name': 'EventGraph', 'nodes': [{'class': 'K2Node_Event', 'event_name': 'ReceiveBeginPlay'}]}]}",
 	{
 		asset_path: z.string().describe("Full asset path to the Blueprint (e.g., '/Game/Blueprints/BP_MyActor')"),
+		max_graphs: z
+			.number()
+			.int()
+			.positive()
+			.optional()
+			.describe("Optional cap on number of graphs returned"),
+		max_nodes_per_graph: z
+			.number()
+			.int()
+			.positive()
+			.optional()
+			.describe("Optional cap on number of nodes returned per graph"),
+		include_pins: z
+			.boolean()
+			.optional()
+			.describe("Include detailed pin/link data (default: true)"),
 	},
-	async ({ asset_path }) => {
-		const result = await tryRunCommand(editorTools.UEBlueprintToText(asset_path))
+	async ({ asset_path, max_graphs, max_nodes_per_graph, include_pins }) => {
+		const result = await tryRunCommand(
+			editorTools.UEBlueprintToText(asset_path, max_graphs, max_nodes_per_graph, include_pins ?? true),
+		)
 		return {
 			content: [
 				{

@@ -23,6 +23,18 @@ def _safe_int(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def _parse_json_value(raw: str, default_value):
+    if raw is None:
+        return default_value
+    text = raw.strip()
+    if not text:
+        return default_value
+    try:
+        return json.loads(text)
+    except Exception:
+        return default_value
+
+
 def _extract_field(blob: str, key: str) -> Optional[str]:
     quoted = re.search(rf'{re.escape(key)}="([^"]*)"', blob)
     if quoted:
@@ -237,7 +249,12 @@ def _export_asset_text(asset) -> str:
             os.unlink(export_file_path)
 
 
-def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
+def blueprint_to_text(
+    asset_path: str,
+    max_graphs: Optional[int] = None,
+    max_nodes_per_graph: Optional[int] = None,
+    include_pins: bool = True,
+) -> Dict[str, Any]:
     asset = unreal.EditorAssetLibrary.load_asset(asset_path)
     if not asset:
         return {"error": f"Asset not found: {asset_path}"}
@@ -251,6 +268,11 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
     export_text = _export_asset_text(asset)
     if not export_text.strip():
         return {"error": f"Exported text is empty for asset: {asset_path}"}
+
+    if isinstance(max_graphs, int) and max_graphs <= 0:
+        max_graphs = None
+    if isinstance(max_nodes_per_graph, int) and max_nodes_per_graph <= 0:
+        max_nodes_per_graph = None
 
     result: Dict[str, Any] = {
         "name": asset.get_name(),
@@ -272,12 +294,27 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
         pass
 
     graphs_by_name: Dict[str, Dict[str, Any]] = {}
-    variables: List[Dict[str, Any]] = []
+    variables_by_name: Dict[str, Dict[str, Any]] = {}
+    components_by_name: Dict[str, Dict[str, str]] = {}
     stack: List[Dict[str, Any]] = []
 
     for raw_line in export_text.splitlines():
         stripped = raw_line.strip()
         if not stripped:
+            continue
+
+        if stripped.startswith("ParentClass=") and "parent_class" not in result:
+            parent_class_path = stripped[len("ParentClass=") :].strip().strip('"')
+            if parent_class_path:
+                result["parent_class_path"] = parent_class_path
+                result["parent_class"] = _short_symbol(parent_class_path)
+            continue
+
+        if stripped.startswith("GeneratedClass=") and "generated_class" not in result:
+            generated_class_path = stripped[len("GeneratedClass=") :].strip().strip('"')
+            if generated_class_path:
+                result["generated_class_path"] = generated_class_path
+                result["generated_class"] = _short_symbol(generated_class_path)
             continue
 
         begin_match = BEGIN_OBJECT_RE.match(stripped)
@@ -292,7 +329,7 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
                 "class_name": class_name,
                 "export_path": export_path,
                 "kind": "other",
-            }
+                }
 
             if class_name == "EdGraph":
                 graph = graphs_by_name.get(object_name)
@@ -331,8 +368,9 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
                     node = {
                         "name": object_name,
                         "class": class_name,
-                        "pins": [],
                     }
+                    if include_pins:
+                        node["pins"] = []
                     node_map[object_name] = node
                     graph["nodes"].append(node)
                 else:
@@ -341,6 +379,13 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
                 context["kind"] = "node"
                 context["node"] = node
                 context["graph_name"] = parent_graph_name
+            elif class_name.endswith("Component"):
+                if object_name not in components_by_name:
+                    components_by_name[object_name] = {
+                        "name": object_name,
+                        "class": class_name,
+                    }
+                context["kind"] = "component"
 
             stack.append(context)
             continue
@@ -359,7 +404,13 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
         if variable_match:
             variable = _parse_new_variable(variable_match.group("body"))
             if variable:
-                variables.append(variable)
+                existing_variable = variables_by_name.get(variable["name"])
+                if not existing_variable:
+                    variables_by_name[variable["name"]] = variable
+                else:
+                    for key, value in variable.items():
+                        if key not in existing_variable:
+                            existing_variable[key] = value
             continue
 
         if current.get("kind") != "node":
@@ -418,32 +469,78 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
                 node["custom_function"] = custom_name
             continue
 
-        pin_match = PIN_RE.match(stripped)
-        if pin_match:
-            pin = _parse_pin(pin_match.group("body"))
-            pin_id = pin.get("id")
-            existing = node.get("pins", [])
-            if pin_id:
-                duplicate = any(existing_pin.get("id") == pin_id for existing_pin in existing)
-                if not duplicate:
+        if include_pins:
+            pin_match = PIN_RE.match(stripped)
+            if pin_match:
+                pin = _parse_pin(pin_match.group("body"))
+                pin_id = pin.get("id")
+                existing = node.get("pins", [])
+                if pin_id:
+                    duplicate = any(existing_pin.get("id") == pin_id for existing_pin in existing)
+                    if not duplicate:
+                        existing.append(pin)
+                else:
                     existing.append(pin)
-            else:
-                existing.append(pin)
-            continue
+                continue
 
-    graphs: List[Dict[str, Any]] = []
+    all_graphs: List[Dict[str, Any]] = []
     for graph in graphs_by_name.values():
         graph.pop("_node_map", None)
-        graph["node_count"] = len(graph["nodes"])
-        graphs.append(graph)
+        all_graphs.append(graph)
 
+    total_graph_count = len(all_graphs)
+    total_node_count = sum(len(graph.get("nodes", [])) for graph in all_graphs)
+
+    graphs = all_graphs
+    truncation: Dict[str, Any] = {}
+    if max_graphs is not None and len(graphs) > max_graphs:
+        truncation["graphs"] = {
+            "total": len(graphs),
+            "returned": max_graphs,
+        }
+        graphs = graphs[:max_graphs]
+
+    returned_node_count = 0
+    if max_nodes_per_graph is not None:
+        truncated_graphs: List[Dict[str, Any]] = []
+        for graph in graphs:
+            original_count = len(graph.get("nodes", []))
+            if original_count > max_nodes_per_graph:
+                graph["nodes"] = graph["nodes"][:max_nodes_per_graph]
+                graph["truncated_nodes"] = original_count - max_nodes_per_graph
+                truncated_graphs.append(
+                    {
+                        "name": graph.get("name"),
+                        "total": original_count,
+                        "returned": max_nodes_per_graph,
+                    }
+                )
+            graph["node_count"] = len(graph.get("nodes", []))
+            returned_node_count += graph["node_count"]
+        if truncated_graphs:
+            truncation["nodes_per_graph"] = truncated_graphs
+    else:
+        for graph in graphs:
+            graph["node_count"] = len(graph.get("nodes", []))
+            returned_node_count += graph["node_count"]
+
+    variables = list(variables_by_name.values())
     if variables:
         result["variables"] = variables
+        result["variable_count"] = len(variables)
+    if components_by_name:
+        result["components"] = list(components_by_name.values())
+        result["component_count"] = len(result["components"])
     if graphs:
         result["graphs"] = graphs
         result["graph_count"] = len(graphs)
-        result["node_count"] = sum(graph.get("node_count", 0) for graph in graphs)
+        result["node_count"] = returned_node_count
 
+    result["total_graph_count"] = total_graph_count
+    result["total_node_count"] = total_node_count
+    result["include_pins"] = include_pins
+    if truncation:
+        result["truncation"] = truncation
     result["line_count"] = len(export_text.splitlines())
     result["character_count"] = len(export_text)
 
@@ -451,7 +548,15 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
 
 
 def main():
-    result = blueprint_to_text("${asset_path}")
+    max_graphs = _parse_json_value("""${max_graphs}""", None)
+    max_nodes_per_graph = _parse_json_value("""${max_nodes_per_graph}""", None)
+    include_pins = _parse_json_value("""${include_pins}""", True)
+    result = blueprint_to_text(
+        "${asset_path}",
+        max_graphs=max_graphs,
+        max_nodes_per_graph=max_nodes_per_graph,
+        include_pins=bool(include_pins),
+    )
     print(json.dumps(result, indent=2))
 
 
