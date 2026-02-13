@@ -75,6 +75,9 @@ export const UEDeleteObject = (actor_names: string) =>
 		actor_names,
 	})
 
+export const UEBlueprintToText = (asset_path: string) =>
+	Template(read("./scripts/ue_blueprint_to_text.py"), { asset_path })
+
 export const UETakeScreenshot = () => Template(read("./scripts/ue_take_screenshot.py"))
 
 export const UEMoveCamera = (
