@@ -1,221 +1,240 @@
-from typing import Dict, Any, List, Optional
-import unreal
+from typing import Any, Dict, List, Optional
 import json
+import os
+import re
+import tempfile
+import unreal
 
 
-def get_pin_default(pin):
+BEGIN_OBJECT_RE = re.compile(
+    r'^Begin Object(?: Class=(?P<class>[^\s]+))? Name="(?P<name>[^"]+)"(?: Archetype=[^\s]+)? ExportPath="(?P<export_path>[^"]+)"$'
+)
+END_OBJECT_RE = re.compile(r"^End Object$")
+PIN_RE = re.compile(r"^CustomProperties Pin \((?P<body>.*)\)$")
+NEW_VARIABLE_RE = re.compile(r"^NewVariables\(\d+\)=\((?P<body>.*)\)$")
+
+
+def _safe_int(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
     try:
-        default = pin.get_editor_property("default_value")
-        if default:
-            return str(default)
+        return int(value)
     except Exception:
-        pass
+        return None
+
+
+def _extract_field(blob: str, key: str) -> Optional[str]:
+    quoted = re.search(rf'{re.escape(key)}="([^"]*)"', blob)
+    if quoted:
+        return quoted.group(1)
+    plain = re.search(rf"{re.escape(key)}=([^,\)]+)", blob)
+    if plain:
+        return plain.group(1)
     return None
 
 
-def get_pin_type_str(pin):
-    try:
-        pin_type = pin.get_editor_property("pin_type")
-        category = str(pin_type.get_editor_property("pin_category"))
-        sub_obj = pin_type.get_editor_property("pin_sub_category_object")
-        if sub_obj:
-            return f"{category}({sub_obj.get_name()})"
-        return category
-    except Exception:
-        return "unknown"
+def _extract_parenthesized_field(blob: str, key: str) -> Optional[str]:
+    marker = f"{key}=("
+    start = blob.find(marker)
+    if start == -1:
+        return None
+
+    index = start + len(marker)
+    depth = 1
+    in_quote = False
+    out: List[str] = []
+
+    while index < len(blob):
+        ch = blob[index]
+        prev = blob[index - 1] if index > 0 else ""
+        if ch == '"' and prev != "\\":
+            in_quote = not in_quote
+
+        if not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return "".join(out)
+
+        out.append(ch)
+        index += 1
+
+    return None
 
 
-def serialize_pin(pin):
-    try:
-        direction = str(pin.get_editor_property("direction"))
-        is_input = "INPUT" in direction.upper() or "EGPD_INPUT" in direction.upper()
-        info = {
-            "name": str(pin.get_editor_property("pin_name")),
-            "direction": "Input" if is_input else "Output",
-            "type": get_pin_type_str(pin),
-        }
-        default = get_pin_default(pin)
-        if default:
-            info["default"] = default
+def _class_from_export_path(export_path: str, explicit_class: Optional[str]) -> str:
+    if explicit_class:
+        return explicit_class.split(".")[-1]
 
-        try:
-            linked = pin.get_editor_property("linked_to")
-            if linked and len(linked) > 0:
-                connections = []
-                for linked_pin in linked:
-                    owner = linked_pin.get_owning_node()
-                    connections.append(f"{owner.get_class().get_name()}:{str(linked_pin.get_editor_property('pin_name'))}")
-                info["connected_to"] = connections
-        except Exception:
-            pass
+    match = re.search(r"/Script/[^']+\.([A-Za-z0-9_]+)'", export_path)
+    if match:
+        return match.group(1)
 
-        return info
-    except Exception:
-        return {"name": "unknown", "direction": "unknown", "type": "unknown"}
+    return "Unknown"
 
 
-def serialize_node(node):
-    node_class = node.get_class().get_name()
-    info = {
-        "class": node_class,
-        "name": node.get_name(),
-    }
-
-    try:
-        comment = node.get_editor_property("node_comment")
-        if comment:
-            info["comment"] = str(comment)
-    except Exception:
-        pass
-
-    if node_class == "K2Node_CallFunction":
-        try:
-            member_ref = node.get_editor_property("function_reference")
-            if member_ref:
-                member_name = member_ref.get_editor_property("member_name")
-                if member_name:
-                    info["function"] = str(member_name)
-                member_parent = member_ref.get_editor_property("member_parent")
-                if member_parent:
-                    info["target_class"] = str(member_parent.get_name())
-        except Exception:
-            pass
-    elif node_class == "K2Node_VariableGet" or node_class == "K2Node_VariableSet":
-        try:
-            var_ref = node.get_editor_property("variable_reference")
-            if var_ref:
-                info["variable"] = str(var_ref.get_editor_property("member_name"))
-        except Exception:
-            pass
-    elif node_class == "K2Node_Event" or node_class == "K2Node_CustomEvent":
-        try:
-            if node_class == "K2Node_CustomEvent":
-                info["event_name"] = str(node.get_editor_property("custom_function_name"))
-            else:
-                member_ref = node.get_editor_property("event_reference")
-                if member_ref:
-                    info["event_name"] = str(member_ref.get_editor_property("member_name"))
-        except Exception:
-            pass
-    elif node_class == "K2Node_MacroInstance":
-        try:
-            macro_graph = node.get_editor_property("macro_graph_reference")
-            if macro_graph:
-                info["macro"] = str(macro_graph.get_name())
-        except Exception:
-            pass
-
-    try:
-        pins = node.get_editor_property("pins")
-        if pins:
-            pin_list = []
-            for pin in pins:
-                pin_name = str(pin.get_editor_property("pin_name"))
-                if pin_name in ("execute", "then", ""):
-                    continue
-                pin_list.append(serialize_pin(pin))
-            if pin_list:
-                info["pins"] = pin_list
-    except Exception:
-        pass
-
-    return info
+def _short_symbol(value: str) -> str:
+    text = value.strip().strip('"')
+    if "'" in text:
+        parts = [part for part in text.split("'") if part]
+        if parts:
+            text = parts[-1]
+    if "/" in text:
+        text = text.split("/")[-1]
+    if "." in text:
+        text = text.split(".")[-1]
+    return text
 
 
-def serialize_graph(graph):
-    graph_info = {
-        "name": graph.get_name(),
-    }
-
-    try:
-        graph_info["class"] = graph.get_class().get_name()
-    except Exception:
-        pass
-
-    nodes = []
-    try:
-        graph_nodes = graph.get_editor_property("nodes")
-        if graph_nodes:
-            for node in graph_nodes:
-                nodes.append(serialize_node(node))
-    except Exception:
-        pass
-
-    graph_info["nodes"] = nodes
-    return graph_info
+def _infer_graph_type(graph_name: str) -> str:
+    lower = graph_name.lower()
+    if "eventgraph" in lower:
+        return "EventGraph"
+    if "construction" in lower:
+        return "ConstructionScript"
+    if "macro" in lower:
+        return "Macro"
+    return "Function"
 
 
-def get_property_info(bp_class):
-    properties = []
-    try:
-        cdo = unreal.get_default_object(bp_class)
-        if not cdo:
-            return properties
+def _parse_reference(line: str, key: str) -> Optional[Dict[str, str]]:
+    body_match = re.search(rf"{re.escape(key)}=\((.*)\)$", line)
+    if not body_match:
+        return None
 
-        for prop in bp_class.properties():
-            try:
-                prop_name = prop.get_name()
-                prop_class = prop.get_class().get_name()
+    body = body_match.group(1)
+    member_name = _extract_field(body, "MemberName")
+    member_parent = _extract_field(body, "MemberParent")
+    member_guid = _extract_field(body, "MemberGuid")
 
-                prop_info = {
-                    "name": prop_name,
-                    "property_class": prop_class,
+    reference: Dict[str, str] = {}
+    if member_name:
+        reference["member_name"] = member_name
+    if member_parent:
+        reference["member_parent"] = member_parent
+        reference["member_parent_short"] = _short_symbol(member_parent)
+    if member_guid:
+        reference["member_guid"] = member_guid
+
+    return reference if reference else None
+
+
+def _parse_pin(body: str) -> Dict[str, Any]:
+    pin: Dict[str, Any] = {}
+
+    pin_id = _extract_field(body, "PinId")
+    pin_name = _extract_field(body, "PinName")
+    direction_raw = _extract_field(body, "Direction")
+    pin_category = _extract_field(body, "PinType.PinCategory")
+    pin_sub_object = _extract_field(body, "PinType.PinSubCategoryObject")
+
+    if pin_id:
+        pin["id"] = pin_id
+    if pin_name is not None:
+        pin["name"] = pin_name
+    if direction_raw:
+        upper = direction_raw.upper()
+        if "OUTPUT" in upper:
+            pin["direction"] = "Output"
+        elif "INPUT" in upper:
+            pin["direction"] = "Input"
+        else:
+            pin["direction"] = direction_raw
+    if pin_category:
+        pin["type"] = pin_category
+    if pin_sub_object and pin_sub_object != "None":
+        pin["sub_type"] = pin_sub_object
+
+    default_value = _extract_field(body, "DefaultValue")
+    if default_value is None:
+        default_value = _extract_field(body, "AutogeneratedDefaultValue")
+    if default_value:
+        pin["default"] = default_value
+
+    default_text = None
+    if "DefaultTextValue=" in body:
+        default_text_match = re.search(r"DefaultTextValue=(.*?),PersistentGuid=", body)
+        if default_text_match:
+            default_text = default_text_match.group(1)
+    if default_text:
+        pin["default_text"] = default_text
+
+    linked_to_blob = _extract_parenthesized_field(body, "LinkedTo")
+    if linked_to_blob:
+        linked_nodes = []
+        for match in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s+([A-F0-9]{16,32})", linked_to_blob):
+            linked_nodes.append(
+                {
+                    "node": match.group(1),
+                    "pin_id": match.group(2),
                 }
+            )
+        if linked_nodes:
+            pin["linked_to"] = linked_nodes
 
-                try:
-                    value = cdo.get_editor_property(prop_name)
-                    if value is not None:
-                        prop_info["default_value"] = str(value)
-                except Exception:
-                    pass
-
-                try:
-                    if prop.has_any_property_flags(unreal.PropertyFlags.BLUEPRINT_VISIBLE):
-                        prop_info["blueprint_visible"] = True
-                    if prop.has_any_property_flags(unreal.PropertyFlags.BLUEPRINT_READ_ONLY):
-                        prop_info["blueprint_read_only"] = True
-                    if prop.has_any_property_flags(unreal.PropertyFlags.EDIT_ANYWHERE):
-                        prop_info["edit_anywhere"] = True
-                    if prop.has_any_property_flags(unreal.PropertyFlags.NET_REPLICATE):
-                        prop_info["replicated"] = True
-                except Exception:
-                    pass
-
-                properties.append(prop_info)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return properties
+    return pin
 
 
-def get_components(bp):
-    components = []
+def _parse_new_variable(body: str) -> Optional[Dict[str, Any]]:
+    name = _extract_field(body, "VarName")
+    if not name:
+        return None
+
+    variable: Dict[str, Any] = {
+        "name": name,
+    }
+
+    friendly_name = _extract_field(body, "FriendlyName")
+    if friendly_name:
+        variable["friendly_name"] = friendly_name
+
+    property_flags = _extract_field(body, "PropertyFlags")
+    if property_flags:
+        variable["property_flags"] = property_flags
+
+    pin_category = _extract_field(body, "PinCategory")
+    if pin_category:
+        variable["type"] = pin_category
+
+    pin_sub_object = _extract_field(body, "PinSubCategoryObject")
+    if pin_sub_object and pin_sub_object != "None":
+        variable["sub_type"] = pin_sub_object
+
+    container_type = _extract_field(body, "ContainerType")
+    if container_type and container_type != "None":
+        variable["container"] = container_type
+
+    return variable
+
+
+def _export_asset_text(asset) -> str:
+    export_task = unreal.AssetExportTask()
+    export_task.automated = True
+    export_task.prompt = False
+    export_task.replace_identical = True
+    export_task.exporter = None
+    export_task.object = asset
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".uasset.copy")
+    export_file_path = temp_file.name
+    temp_file.close()
+
     try:
-        scs = bp.get_editor_property("simple_construction_script")
-        if scs:
-            root_nodes = scs.get_all_nodes()
-            for scs_node in root_nodes:
-                try:
-                    template = scs_node.get_editor_property("component_template")
-                    if template:
-                        comp_info = {
-                            "name": template.get_name(),
-                            "class": template.get_class().get_name(),
-                        }
+        export_task.filename = export_file_path
+        result = unreal.Exporter.run_asset_export_task(export_task)
+        if not result:
+            raise RuntimeError(
+                f"Failed to export asset {asset.get_name()} to {export_file_path}"
+            )
 
-                        parent_node = scs_node.get_editor_property("parent_component_or_variable_name")
-                        if parent_node:
-                            comp_info["parent"] = str(parent_node)
-
-                        components.append(comp_info)
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-    return components
+        with open(export_file_path, "rb") as file:
+            data = file.read()
+        return data.decode("utf-8", errors="ignore")
+    finally:
+        if os.path.exists(export_file_path):
+            os.unlink(export_file_path)
 
 
 def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
@@ -223,91 +242,210 @@ def blueprint_to_text(asset_path: str) -> Dict[str, Any]:
     if not asset:
         return {"error": f"Asset not found: {asset_path}"}
 
-    if not isinstance(asset, unreal.Blueprint):
-        return {"error": f"Asset is not a Blueprint: {asset_path} (class: {asset.get_class().get_name()})"}
+    asset_class_name = asset.get_class().get_name()
+    if "Blueprint" not in asset_class_name:
+        return {
+            "error": f"Asset is not a Blueprint-like asset: {asset_path} (class: {asset_class_name})"
+        }
 
-    result = {
+    export_text = _export_asset_text(asset)
+    if not export_text.strip():
+        return {"error": f"Exported text is empty for asset: {asset_path}"}
+
+    result: Dict[str, Any] = {
         "name": asset.get_name(),
         "path": asset.get_path_name(),
+        "asset_class": asset_class_name,
+        "source": "AssetExportTask text export parsing",
     }
 
+    # Runtime metadata where available.
     try:
-        gen_class = asset.get_editor_property("generated_class")
-        if gen_class:
-            result["generated_class"] = gen_class.get_name()
-            parent = gen_class.get_super_class()
-            if parent:
-                result["parent_class"] = parent.get_name()
+        if hasattr(asset, "generated_class"):
+            generated_class = asset.generated_class()
+            if generated_class:
+                result["generated_class"] = generated_class.get_name()
+                parent_class = generated_class.get_super_class()
+                if parent_class:
+                    result["parent_class"] = parent_class.get_name()
     except Exception:
         pass
 
-    try:
-        bp_type = str(asset.get_editor_property("blueprint_type"))
-        result["blueprint_type"] = bp_type
-    except Exception:
-        pass
+    graphs_by_name: Dict[str, Dict[str, Any]] = {}
+    variables: List[Dict[str, Any]] = []
+    stack: List[Dict[str, Any]] = []
 
-    try:
-        interfaces = asset.get_editor_property("implemented_interfaces")
-        if interfaces and len(interfaces) > 0:
-            result["interfaces"] = []
-            for iface in interfaces:
-                try:
-                    iface_class = iface.get_editor_property("interface")
-                    if iface_class:
-                        result["interfaces"].append(iface_class.get_name())
-                except Exception:
-                    continue
-    except Exception:
-        pass
+    for raw_line in export_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
 
-    try:
-        gen_class = asset.get_editor_property("generated_class")
-        if gen_class:
-            props = get_property_info(gen_class)
-            if props:
-                result["variables"] = props
-    except Exception:
-        pass
+        begin_match = BEGIN_OBJECT_RE.match(stripped)
+        if begin_match:
+            explicit_class = begin_match.group("class")
+            object_name = begin_match.group("name")
+            export_path = begin_match.group("export_path")
+            class_name = _class_from_export_path(export_path, explicit_class)
 
-    components = get_components(asset)
-    if components:
-        result["components"] = components
+            context: Dict[str, Any] = {
+                "name": object_name,
+                "class_name": class_name,
+                "export_path": export_path,
+                "kind": "other",
+            }
 
-    graphs = []
+            if class_name == "EdGraph":
+                graph = graphs_by_name.get(object_name)
+                if not graph:
+                    graph = {
+                        "name": object_name,
+                        "graph_type": _infer_graph_type(object_name),
+                        "nodes": [],
+                        "_node_map": {},
+                    }
+                    graphs_by_name[object_name] = graph
+                context["kind"] = "graph"
+                context["graph_name"] = object_name
 
-    try:
-        ubergraph_pages = asset.get_editor_property("ubergraph_pages")
-        if ubergraph_pages:
-            for graph in ubergraph_pages:
-                g = serialize_graph(graph)
-                g["graph_type"] = "EventGraph"
-                graphs.append(g)
-    except Exception:
-        pass
+            elif "K2Node_" in class_name:
+                parent_graph_name = None
+                for parent in reversed(stack):
+                    if parent.get("kind") == "graph":
+                        parent_graph_name = parent.get("graph_name")
+                        break
 
-    try:
-        function_graphs = asset.get_editor_property("function_graphs")
-        if function_graphs:
-            for graph in function_graphs:
-                g = serialize_graph(graph)
-                g["graph_type"] = "Function"
-                graphs.append(g)
-    except Exception:
-        pass
+                if not parent_graph_name:
+                    parent_graph_name = "UnknownGraph"
+                    if parent_graph_name not in graphs_by_name:
+                        graphs_by_name[parent_graph_name] = {
+                            "name": parent_graph_name,
+                            "graph_type": "Unknown",
+                            "nodes": [],
+                            "_node_map": {},
+                        }
 
-    try:
-        macro_graphs = asset.get_editor_property("macro_graphs")
-        if macro_graphs:
-            for graph in macro_graphs:
-                g = serialize_graph(graph)
-                g["graph_type"] = "Macro"
-                graphs.append(g)
-    except Exception:
-        pass
+                graph = graphs_by_name[parent_graph_name]
+                node_map = graph["_node_map"]
+                node = node_map.get(object_name)
+                if not node:
+                    node = {
+                        "name": object_name,
+                        "class": class_name,
+                        "pins": [],
+                    }
+                    node_map[object_name] = node
+                    graph["nodes"].append(node)
+                else:
+                    node["class"] = class_name
 
+                context["kind"] = "node"
+                context["node"] = node
+                context["graph_name"] = parent_graph_name
+
+            stack.append(context)
+            continue
+
+        if END_OBJECT_RE.match(stripped):
+            if stack:
+                stack.pop()
+            continue
+
+        if not stack:
+            continue
+
+        current = stack[-1]
+
+        variable_match = NEW_VARIABLE_RE.match(stripped)
+        if variable_match:
+            variable = _parse_new_variable(variable_match.group("body"))
+            if variable:
+                variables.append(variable)
+            continue
+
+        if current.get("kind") != "node":
+            continue
+
+        node = current["node"]
+
+        node_pos_x = re.search(r"^NodePosX=(-?\d+)$", stripped)
+        if node_pos_x:
+            node["pos_x"] = _safe_int(node_pos_x.group(1))
+            continue
+
+        node_pos_y = re.search(r"^NodePosY=(-?\d+)$", stripped)
+        if node_pos_y:
+            node["pos_y"] = _safe_int(node_pos_y.group(1))
+            continue
+
+        node_guid = re.search(r"^NodeGuid=([A-F0-9]{32})$", stripped)
+        if node_guid:
+            node["guid"] = node_guid.group(1)
+            continue
+
+        if stripped.startswith("NodeComment="):
+            node["comment"] = stripped[len("NodeComment=") :].strip().strip('"')
+            continue
+
+        if stripped.startswith("EventReference="):
+            event_ref = _parse_reference(stripped, "EventReference")
+            if event_ref:
+                node["event_reference"] = event_ref
+                if "member_name" in event_ref:
+                    node["event_name"] = event_ref["member_name"]
+            continue
+
+        if stripped.startswith("FunctionReference="):
+            function_ref = _parse_reference(stripped, "FunctionReference")
+            if function_ref:
+                node["function_reference"] = function_ref
+                if "member_name" in function_ref:
+                    node["function"] = function_ref["member_name"]
+                if "member_parent_short" in function_ref:
+                    node["function_owner"] = function_ref["member_parent_short"]
+            continue
+
+        if stripped.startswith("VariableReference="):
+            variable_ref = _parse_reference(stripped, "VariableReference")
+            if variable_ref:
+                node["variable_reference"] = variable_ref
+                if "member_name" in variable_ref:
+                    node["variable"] = variable_ref["member_name"]
+            continue
+
+        if stripped.startswith("CustomFunctionName="):
+            custom_name = stripped[len("CustomFunctionName=") :].strip().strip('"')
+            if custom_name:
+                node["custom_function"] = custom_name
+            continue
+
+        pin_match = PIN_RE.match(stripped)
+        if pin_match:
+            pin = _parse_pin(pin_match.group("body"))
+            pin_id = pin.get("id")
+            existing = node.get("pins", [])
+            if pin_id:
+                duplicate = any(existing_pin.get("id") == pin_id for existing_pin in existing)
+                if not duplicate:
+                    existing.append(pin)
+            else:
+                existing.append(pin)
+            continue
+
+    graphs: List[Dict[str, Any]] = []
+    for graph in graphs_by_name.values():
+        graph.pop("_node_map", None)
+        graph["node_count"] = len(graph["nodes"])
+        graphs.append(graph)
+
+    if variables:
+        result["variables"] = variables
     if graphs:
         result["graphs"] = graphs
+        result["graph_count"] = len(graphs)
+        result["node_count"] = sum(graph.get("node_count", 0) for graph in graphs)
+
+    result["line_count"] = len(export_text.splitlines())
+    result["character_count"] = len(export_text)
 
     return result
 

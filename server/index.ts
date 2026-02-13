@@ -173,7 +173,7 @@ server.tool(
 
 server.tool(
 	"editor_export_asset",
-	"Export an Unreal asset to its binary .uasset format\n\nNote: This returns raw binary data, NOT human-readable text. For Blueprint introspection, use editor_blueprint_to_text instead.\n\nReturns the raw binary content of the exported asset.",
+	"Export an Unreal asset using Unreal's raw export pipeline.\n\nFor many assets (including Blueprints), Unreal returns text-export content; for some assets this may still be non-human-readable payload.\n\nUse editor_blueprint_to_text for a structured Blueprint JSON representation.",
 	{
 		asset_path: z.string(),
 	},
@@ -192,7 +192,7 @@ server.tool(
 
 server.tool(
 	"editor_blueprint_to_text",
-	"Convert a Blueprint asset to a human-readable JSON text representation.\n\nIntrospects the Blueprint and returns its parent class, variables (with types, defaults, flags), components, implemented interfaces, and all graph logic (EventGraph, Functions, Macros) with nodes, pins, connections, and function calls.\n\nThis is the tool to use when you need to understand what a Blueprint does in order to convert it to C++ or analyze its logic.\n\nExample output: {'name': 'BP_MyActor', 'parent_class': 'Actor', 'variables': [{'name': 'Health', 'property_class': 'FloatProperty', 'default_value': '100.0'}], 'components': [{'name': 'Mesh', 'class': 'StaticMeshComponent'}], 'graphs': [{'name': 'EventGraph', 'graph_type': 'EventGraph', 'nodes': [{'class': 'K2Node_Event', 'event_name': 'ReceiveBeginPlay'}]}]}",
+	"Convert a Blueprint asset to a human-readable structured JSON representation.\n\nParses Unreal's text export of the Blueprint and returns metadata plus graph logic (EventGraph/Function/Macro graphs), nodes, pins, links, variable declarations, and common references (events/functions/variables).\n\nUse this tool to analyze Blueprint behavior for BP-to-C++ migration.\n\nExample output: {'name': 'BP_MyActor', 'parent_class': 'Actor', 'variables': [{'name': 'Health', 'type': 'float'}], 'graphs': [{'name': 'EventGraph', 'nodes': [{'class': 'K2Node_Event', 'event_name': 'ReceiveBeginPlay'}]}]}",
 	{
 		asset_path: z.string().describe("Full asset path to the Blueprint (e.g., '/Game/Blueprints/BP_MyActor')"),
 	},
